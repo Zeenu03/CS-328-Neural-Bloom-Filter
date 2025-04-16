@@ -1,93 +1,98 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from model import NeuralBloomFilter  
+import torchvision
+import torchvision.transforms as transforms
+from model import NeuralBloomFilter  # This imports your module from model.py
 
-# For simplicity, we create a dummy task function that simulates a set-membership task.
-# In each task, we create a small "storage set" S and a "query set" Q.
-# Items in S have label 1; items not in S have label 0.
-def sample_task(num_storage=10, num_queries=10, channels=1, height=28, width=28):
-    # Create dummy storage images (e.g. random noise simulating MNIST images)
-    storage_images = torch.randn(num_storage, channels, height, width)
-    # Queries: first num_storage images (in S) and then num_queries images (not in S)
-    queries_in = storage_images.clone()  # these should be recognized (label=1)
-    queries_out = torch.randn(num_queries, channels, height, width)  # not stored (label=0)
+# Simple classifier that maps the read vector to 10 classes
+class NFClassifier(nn.Module):
+    def __init__(self, word_size=32, num_classes=10):
+        super(NFClassifier, self).__init__()
+        self.fc = nn.Linear(word_size, num_classes)
     
-    queries = torch.cat([queries_in, queries_out], dim=0)
-    # Labels: ones for in-set, zeros for out-of-set
-    labels = torch.cat([torch.ones(num_storage), torch.zeros(num_queries)], dim=0)
-    return storage_images, queries, labels
-
-# A simple classifier that maps the read vector (from NeuralBloomFilter) to a membership probability.
-class MembershipClassifier(nn.Module):
-    def __init__(self, word_size):
-        super(MembershipClassifier, self).__init__()
-        self.fc = nn.Linear(word_size, 1)
     def forward(self, x):
-        return torch.sigmoid(self.fc(x))
+        return self.fc(x)
 
-# Training loop for meta-learning tasks.
-def train_model(model, classifier, optimizer, clf_optimizer, num_tasks, device):
-    model.train()
-    classifier.train()
-    criterion = nn.BCELoss()
-    total_loss = 0.0
-    for task in range(num_tasks):
-        # Reset the model's memory for each task
-        model.memory.zero_()
-        
-        # Sample a task: get storage set S and query set Q with labels
-        storage_images, queries, labels = sample_task(num_storage=10, num_queries=10)
-        storage_images = storage_images.to(device)
-        queries = queries.to(device)
-        labels = labels.to(device).unsqueeze(1)  # shape (N, 1)
+# Hyperparameters
+batch_size = 64
+num_epochs = 5
+learning_rate = 0.001
 
-        # Write phase: write each storage image into the neural memory.
-        # We assume batch size 1 per write for simplicity.
-        for img in storage_images:
-            img = img.unsqueeze(0)  # add batch dimension
-            # Write mode: update memory with this image.
-            model.forward(img, mode='write')
-        
-        # Read phase: process the query set to get the read vector.
-        read_vector, _ = model.forward(queries, mode='read')  # read_vector: (num_queries_total, word_size)
-        
-        # Use the classifier to predict membership from the read vector.
-        outputs = classifier(read_vector)
-        
-        # Compute binary cross-entropy loss.
-        loss = criterion(outputs, labels)
-        
-        # Backpropagation and parameter update.
+# MNIST transforms and dataset
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,))  # standard MNIST normalization
+])
+
+trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2)
+
+testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+# Set computation device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Initialize the Neural Bloom Filter module and the classifier
+nbf = NeuralBloomFilter(memory_slots=10, word_size=32).to(device)
+classifier = NFClassifier(word_size=32, num_classes=10).to(device)
+
+# Combine parameters of both modules for the optimizer
+optimizer = optim.Adam(list(nbf.parameters()) + list(classifier.parameters()), lr=learning_rate)
+
+# Loss function: CrossEntropyLoss expects logits and target class indices
+criterion = nn.CrossEntropyLoss()
+
+# Training loop
+nbf.train()
+classifier.train()
+for epoch in range(num_epochs):
+    running_loss = 0.0
+    for batch_idx, (images, labels) in enumerate(trainloader):
+        images = images.to(device)
+        labels = labels.to(device)
+
+        # Reset gradients and clear the memory buffer at the start of each batch
         optimizer.zero_grad()
-        clf_optimizer.zero_grad()
+        nbf.memory.zero_()  # Reset memory for each batch
+
+        # Write phase: update memory with all images in the batch.
+        # Here, we simply perform a write pass on the entire batch.
+        _ = nbf.forward(images, mode='write')
+        
+        # Read phase: get the feature vector from the memory using the same images.
+        read_vector, _ = nbf.forward(images, mode='read')  # shape: (batch_size, word_size)
+        
+        # Classifier: predict digit classes from the read feature vector.
+        logits = classifier(read_vector)  # shape: (batch_size, 10)
+        
+        loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
-        clf_optimizer.step()
         
-        total_loss += loss.item()
-        if (task + 1) % 10 == 0:
-            print(f"Task {task + 1}/{num_tasks}, Loss: {loss.item():.4f}")
-    avg_loss = total_loss / num_tasks
-    print(f"Average Loss: {avg_loss:.4f}")
-    return avg_loss
+        running_loss += loss.item()
+        if (batch_idx + 1) % 100 == 0:
+            print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(trainloader)}], Loss: {loss.item():.4f}")
+    avg_loss = running_loss / len(trainloader)
+    print(f"Epoch [{epoch+1}/{num_epochs}] Average Loss: {avg_loss:.4f}")
 
-if __name__ == '__main__':
-    # Set the computation device.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Initialize the Neural Bloom Filter model.
-    # For example, here we use 10 memory slots and a word size of 32.
-    model = NeuralBloomFilter(memory_slots=10, word_size=32).to(device)
-    
-    # Initialize the membership classifier.
-    classifier = MembershipClassifier(word_size=32).to(device)
-    
-    # Define separate optimizers for the Neural Bloom Filter and the classifier.
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    clf_optimizer = optim.Adam(classifier.parameters(), lr=0.001)
-    
-    # Train the model on a number of meta-learning tasks (episodes).
-    num_tasks = 100  # You can adjust the number of training episodes.
-    train_model(model, classifier, optimizer, clf_optimizer, num_tasks, device)
+# Evaluation on test set
+nbf.eval()
+classifier.eval()
+correct = 0
+total = 0
+with torch.no_grad():
+    for images, labels in testloader:
+        images = images.to(device)
+        labels = labels.to(device)
+        # Reset memory for the test batch
+        nbf.memory.zero_()
+        _ = nbf.forward(images, mode='write')
+        features, _ = nbf.forward(images, mode='read')
+        outputs = classifier(features)
+        _, predicted = torch.max(outputs, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+        
+print(f"Test Accuracy: {100 * correct / total:.2f}%")
