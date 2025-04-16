@@ -23,9 +23,7 @@ class SimpleEncoder(nn.Module):
         x = self.fc(x)
         return x  # output shape: (batch_size, 128)
 
-###############################################
-# 2. Neural Bloom Filter Module
-###############################################
+
 class NeuralBloomFilter(nn.Module):
     def __init__(self, memory_slots=10, word_size=32, class_num=10):
         """
@@ -49,9 +47,9 @@ class NeuralBloomFilter(nn.Module):
 
         # MLP for final output: maps read vector to class_num
         self.mlp = nn.Sequential(
-            nn.Linear(word_size, 128), # (batch_size, word_size) -> (batch_size, 128)
+            nn.Linear(2*word_size + 128, 128), #(batch_size, word_size) -> (batch_size, 128)
             nn.ReLU(),
-            nn.Linear(128, class_num) # (batch_size, 128) -> (batch_size, class_num)
+            nn.Linear(128, class_num) #(batch_size, 128) -> (batch_size, class_num)
         )
  
     def write(self, x):
@@ -81,14 +79,15 @@ class NeuralBloomFilter(nn.Module):
         Read operation: Given input x, generate query vector q, compute addressing weights a, 
         then read from memory via weighted sum: read_vector = a @ M, resulting in a vector of dimension word_size.
         """
-        z = self.encoder(x)         # (batch_size, 128)
+        z = self.encoder(x)  # (batch_size, 128)
+        w = self.fc_w(z)            # (batch_size, word_size)
         q = self.fc_q(z)            # (batch_size, word_size)
         a_logits = torch.matmul(q, self.A)  # (batch_size, memory_slots)
         a = F.softmax(a_logits, dim=1)                   # (batch_size, memory_slots)
         # Read: weighted sum over memory slots:
         read_vector = torch.matmul(a, self.M)       # (batch_size, word_size)
-        
-        logits = self.mlp(read_vector) # (batch_size, class_num)
+        vector = torch.concat([read_vector, w, z], dim=1) # (batch_size, word_size + word_size + 128)
+        logits = self.mlp(vector) # (batch_size, class_num)
         return logits
 
     def forward(self, x, mode='read'):
@@ -124,59 +123,3 @@ print(probs)
 _, predicted_class = torch.max(probs, 1)
 print("Predicted classes:")
 print(predicted_class)
-
-# ###############################################
-# # 3. Backup Bloom Filter (classical implementation)
-# ###############################################
-# class BackupBloomFilter:
-#     def __init__(self, capacity, error_rate):
-#         """
-#         capacity: Expected number of elements
-#         error_rate: Desired false positive rate (e.g., 0.01)
-#         """
-#         self.capacity = capacity
-#         self.error_rate = error_rate
-#         self.num_bits = self.get_num_bits(capacity, error_rate)
-#         self.num_hashes = self.get_num_hashes(self.num_bits, capacity)
-#         # Using a simple Python list for bit array (0 or 1)
-#         self.bit_array = [0] * self.num_bits
-
-#     def add(self, item):
-#         """
-#         Adds an item to the Bloom filter by hashing it with num_hashes and setting bits.
-#         """
-#         for i in range(self.num_hashes):
-#             hash_val = mmh3.hash(str(item), i) % self.num_bits
-#             self.bit_array[hash_val] = 1
-
-#     def __contains__(self, item):
-#         """
-#         Returns True if the item is probably in the filter (all corresponding bits are 1),
-#         or False if the item is definitely not in the filter.
-#         """
-#         for i in range(self.num_hashes):
-#             hash_val = mmh3.hash(str(item), i) % self.num_bits
-#             if self.bit_array[hash_val] == 0:
-#                 return False
-#         return True
-
-#     @staticmethod
-#     def get_num_bits(capacity, error_rate):
-#         """
-#         Calculates the number of bits (m) needed using: m = - (n * ln(p)) / (ln(2)^2)
-#         """
-#         m = - (capacity * math.log(error_rate)) / (math.log(2) ** 2)
-#         return int(m)
-
-#     @staticmethod
-#     def get_num_hashes(num_bits, capacity):
-#         """
-#         Calculates the number of hash functions (k) using: k = (m / n) * ln(2)
-#         """
-#         k = (num_bits / capacity) * math.log(2)
-#         return int(k)
-
-# if __name__ == '__main__':
-#     (x_train, y_train), (x_test, y_test) = mnist.load_data()
-#     print(x_train.shape, y_train.shape)
-    
