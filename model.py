@@ -1,9 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-import mmh3 
+import matplotlib.pyplot as plt
+import numpy as np
+import tensorflow as tf
 from tensorflow.keras.datasets import mnist
+import random
+import mmh3
+from bitarray import bitarray
+import torch.optim as optim
+import seaborn as sns
+from latex import latexify, format_axes
+latexify(columns=2)
 
 class SimpleEncoder(nn.Module):
     def __init__(self):
@@ -22,104 +30,59 @@ class SimpleEncoder(nn.Module):
         x = self.conv(x)
         x = self.fc(x)
         return x  # output shape: (batch_size, 128)
-
-
+    
 class NeuralBloomFilter(nn.Module):
-    def __init__(self, memory_slots=10, word_size=32, class_num=10):
-        """
-        memory_slots: Number of memory slots (columns in memory matrix)
-        word_size: Dimension of the write word and query vector
-        """
-        super(NeuralBloomFilter, self).__init__()
+    def __init__(self, memory_slots=10, word_size=32, class_num=1):
+        super().__init__()
         self.encoder = SimpleEncoder()
-        
-        # f_w: maps encoder output to a write word of dimension word_size
-        self.fc_w = nn.Linear(128, word_size)
-        
-        # f_q: maps encoder output to a query vector of dimension word_size
-        self.fc_q = nn.Linear(128, word_size)
-        
-        # Learnable addressing matrix A: shape (word_size, memory_slots)
-        self.A = nn.Parameter(torch.randn(word_size, memory_slots), requires_grad=True)
-        
-        # Memory matrix M: shape (memory_slots, word_size), stored as a buffer (non-trainable)
+        self.fc_q    = nn.Linear(128, word_size)
+        self.fc_w    = nn.Linear(128, word_size)
+        self.A       = nn.Parameter(torch.randn(word_size, memory_slots))
         self.register_buffer('M', torch.zeros(memory_slots, word_size))
-
-        # MLP for final output: maps read vector to class_num
+        inp_dim = memory_slots*word_size + word_size + 128
         self.mlp = nn.Sequential(
-            nn.Linear(2*word_size + 128, 128), #(batch_size, word_size) -> (batch_size, 128)
+            nn.Linear(inp_dim, 128),
             nn.ReLU(),
-            nn.Linear(128, class_num) #(batch_size, 128) -> (batch_size, class_num)
+            nn.Linear(128, class_num)
         )
- 
+
+    def controller(self, x):
+        """
+        x -> (B, 1, 28, 28): input image
+        Runs the encoder, computes query q, write word w, and normalized address a.
+        Returns (a, w, z).
+        """
+        z = self.encoder(x)                   # (B,128)
+        q = self.fc_q(z)                      # (B,word_size)
+        w = self.fc_w(z)                      # (B,word_size)
+        a_logits = q @ self.A                 # (B,slots)
+        a = F.softmax(a_logits, dim=1)        # (B,slots)
+        return a, w, z
+
     def write(self, x):
         """
-        Write operation: Encode input x, generate write word w and query vector q,
-        compute addressing weights a via softmax(q @ A), then update memory: M = M + outer(w, a)
+        Write all x in one shot:
+          M ← M + ∑_i w_i a_i^T
         """
-        z = self.encoder(x)         # (batch_size, 128)
-        w = self.fc_w(z)            # (batch_size, word_size)
-        q = self.fc_q(z)            # (batch_size, word_size)
-
-        a_logits = torch.matmul(q, self.A)  # (batch_size, memory_slots)
-        a = F.softmax(a_logits, dim=1)                   # (batch_size, memory_slots)
-        
-        
-        # a -> (batch_size, memory_slots) and w -> (batch_size, word_size)
-        # a.unsqueeze(2) -> (batch_size, memory_slots, 1)
-        # w.unsqueeze(1) -> (batch_size, 1, word_size)
-        update = torch.matmul(a.unsqueeze(2), w.unsqueeze(1))  # (batch_size, memory_slots, word_size)
-        
-        self.M = self.M + update.sum(dim=0) # (memory_slots, word_size)
-        
-        return a 
+        a, w, _ = self.controller(x)          # a:(B,slots), w:(B,word_size)
+        # Outer product per sample: update_i[k,p] = a[i,k] * w[i,p]
+        # Stack them and sum over batch:
+        # shape: (B, slots, word_size)
+        update = torch.einsum('bk,bp->bkp', a, w)
+        # Add to memory and detach so writes don't backprop through time:
+        self.M = self.M + update.sum(dim=0).detach()
 
     def read(self, x):
         """
-        Read operation: Given input x, generate query vector q, compute addressing weights a, 
-        then read from memory via weighted sum: read_vector = a @ M, resulting in a vector of dimension word_size.
+        Read operation:
+          r_i = flatten( M ⊙ a_i )  (componentwise)
+          logits = f_out([r_i, w_i, z_i])
         """
-        z = self.encoder(x)  # (batch_size, 128)
-        w = self.fc_w(z)            # (batch_size, word_size)
-        q = self.fc_q(z)            # (batch_size, word_size)
-        a_logits = torch.matmul(q, self.A)  # (batch_size, memory_slots)
-        a = F.softmax(a_logits, dim=1)                   # (batch_size, memory_slots)
-        # Read: weighted sum over memory slots:
-        read_vector = torch.matmul(a, self.M)       # (batch_size, word_size)
-        vector = torch.concat([read_vector, w, z], dim=1) # (batch_size, word_size + word_size + 128)
-        logits = self.mlp(vector) # (batch_size, class_num)
-        return logits
-
-    def forward(self, x, mode='read'):
-        if mode == 'write':
-            return self.write(x)
-        else:
-            return self.read(x)
-        
-        
-# Example usage:
-model = NeuralBloomFilter(memory_slots=3, word_size=2, class_num=2)
-x = torch.randn(1, 1, 28, 28)
-
-model.write(x)
-
-# Print the memory matrix M after writing
-print("Memory matrix M after write:")
-print(model.M.shape)
-
-# Read from the memory
-logits = model.read(x)
-print("Logits after read:")
-print(logits.shape)
-print(logits)
-
-# Convert logits to probabilities
-probs = F.softmax(logits, dim=1)
-print("Probabilities:")
-print(probs.shape)
-print(probs)
-
-# Final class predictions
-_, predicted_class = torch.max(probs, 1)
-print("Predicted classes:")
-print(predicted_class)
+        a, w, z = self.controller(x)          # (B,slots), (B,word_size), (B,128)
+        # M ⊙ a_i: scale each row of M by a_i:
+        # shape before flatten: (B, slots, word_size)
+        r = (a.unsqueeze(2) * self.M.unsqueeze(0)).reshape(x.size(0), -1)  # (B, slots*word_size)
+        # Concatenate r, w, z:
+        concat = torch.cat([r, w, z], dim=1)                              # (B, inp_dim)
+        logits = self.mlp(concat)                                          # (B, class_num)
+        return logits,a
